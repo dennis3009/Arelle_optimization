@@ -680,7 +680,8 @@ def _preReadCsvFiles(modelXbrl, tables, _dir):
                 pathsToRead.append(tablePath)
 
     if pathsToRead:
-        with ThreadPoolExecutor(max_workers=min(4, len(pathsToRead))) as executor:
+        _max_workers = min(os.cpu_count() or 4, len(pathsToRead))
+        with ThreadPoolExecutor(max_workers=_max_workers) as executor:
             futures = {executor.submit(_readOne, p): p for p in pathsToRead}
             for future in as_completed(futures):
                 tablePath, data = future.result()
@@ -2154,8 +2155,6 @@ def _loadFromOIM(cntlr, error, warning, modelXbrl, oimFile, mappedUri):
 
         numFactCreationXbrlErrors = 0
 
-        # Cache for concept lookups to avoid repeated dictionary lookups
-        _conceptCache = {}  # conceptSQName -> (conceptQn, concept) or None
         _qnameConcepts = modelXbrl.qnameConcepts  # local reference for faster access
 
         contextElement = getTaxonomyContextElement(modelXbrl)

@@ -275,9 +275,9 @@ class ValidateXbrl:
                 futFacts = executor.submit(self.checkFacts, modelXbrl.facts)
                 futContexts = executor.submit(self.checkContexts, self.modelXbrl.contexts.values())
                 futUnits = executor.submit(self.checkUnits, self.modelXbrl.units.values())
-                futFacts.result()
-                futContexts.result()
-                futUnits.result()
+                # Collect all results, re-raising any exceptions
+                for fut in (futFacts, futContexts, futUnits):
+                    fut.result()
             self.checkDuplicateFacts(modelXbrl.facts, self.validateDuplicateFacts)
 
             modelXbrl.profileStat(_("validateInstance"))
@@ -297,8 +297,8 @@ class ValidateXbrl:
                 with ThreadPoolExecutor(max_workers=2) as executor:
                     futFactDims = executor.submit(self.checkFactsDimensions, modelXbrl.facts)
                     futCtxDims = executor.submit(self.checkContextsDimensions, modelXbrl.contexts.values())
-                    futFactDims.result()
-                    futCtxDims.result()
+                    for fut in (futFactDims, futCtxDims):
+                        fut.result()
                 modelXbrl.profileStat(_("validateDimensions"))
 
         # dimensional validity

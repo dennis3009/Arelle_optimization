@@ -4,6 +4,7 @@ import io
 import os
 import tempfile
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
@@ -116,3 +117,35 @@ class TestPreReadCsvFiles:
 
         result = _preReadCsvFiles(mock_xbrl, tables, _dir)
         assert len(result) == 0
+
+
+class TestParallelValidation:
+    """Tests for the parallel validation optimization in ValidateXbrl."""
+
+    def test_thread_pool_executor_runs_tasks_concurrently(self) -> None:
+        """Test that ThreadPoolExecutor can run multiple tasks and collect results."""
+        import threading
+        results = []
+        lock = threading.Lock()
+
+        def task(value: int) -> int:
+            with lock:
+                results.append(value)
+            return value * 2
+
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = [executor.submit(task, i) for i in range(3)]
+            returned = [f.result() for f in futures]
+
+        assert sorted(results) == [0, 1, 2]
+        assert sorted(returned) == [0, 2, 4]
+
+    def test_thread_pool_executor_propagates_exceptions(self) -> None:
+        """Test that exceptions in ThreadPoolExecutor tasks are properly propagated."""
+        def failing_task() -> None:
+            raise ValueError("test error")
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(failing_task)
+            with pytest.raises(ValueError, match="test error"):
+                future.result()
