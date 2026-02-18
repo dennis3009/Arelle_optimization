@@ -4,6 +4,7 @@ See COPYRIGHT.md for copyright information.
 from __future__ import annotations
 import regex as re
 import math
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, TYPE_CHECKING, cast
 from arelle import (XmlUtil, XbrlUtil, XbrlConst,
                     ValidateXbrlCalcs, ValidateXbrlDimensions, ValidateXbrlDTS, ValidateUtr, ValidateDuplicateFacts)
@@ -269,9 +270,14 @@ class ValidateXbrl:
         modelXbrl.modelManager.showStatus(_("validating instance"))
         assert modelXbrl.modelDocument is not None, _("Instance has no ModelDocument object")
         if modelXbrl.modelDocument.type in (ModelDocumentType.INSTANCE, ModelDocumentType.INLINEXBRL, ModelDocumentType.INLINEXBRLDOCUMENTSET):
-            self.checkFacts(modelXbrl.facts)
-            self.checkContexts(self.modelXbrl.contexts.values())
-            self.checkUnits(self.modelXbrl.units.values())
+            # Run fact checks and context/unit checks concurrently
+            with ThreadPoolExecutor(max_workers=3) as executor:
+                futFacts = executor.submit(self.checkFacts, modelXbrl.facts)
+                futContexts = executor.submit(self.checkContexts, self.modelXbrl.contexts.values())
+                futUnits = executor.submit(self.checkUnits, self.modelXbrl.units.values())
+                # Collect all results, re-raising any exceptions
+                for fut in (futFacts, futContexts, futUnits):
+                    fut.result()
             self.checkDuplicateFacts(modelXbrl.facts, self.validateDuplicateFacts)
 
             modelXbrl.profileStat(_("validateInstance"))
@@ -287,8 +293,12 @@ class ValidateXbrl:
                     ValidateXbrlDimensions.checkFact(self, f, dimCheckableFacts)
                 del dimCheckableFacts
                 '''
-                self.checkFactsDimensions(modelXbrl.facts) # check fact dimensions in document order
-                self.checkContextsDimensions(modelXbrl.contexts.values())
+                # Run fact dimensions and context dimensions checks concurrently
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    futFactDims = executor.submit(self.checkFactsDimensions, modelXbrl.facts)
+                    futCtxDims = executor.submit(self.checkContextsDimensions, modelXbrl.contexts.values())
+                    for fut in (futFactDims, futCtxDims):
+                        fut.result()
                 modelXbrl.profileStat(_("validateDimensions"))
 
         # dimensional validity
