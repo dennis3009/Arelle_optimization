@@ -12,6 +12,7 @@ import sys
 import time
 import traceback
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from math import log10
 
 import isodate
@@ -652,6 +653,43 @@ def getTaxonomyContextElement(modelXbrl: ModelXbrl.ModelXbrl) -> str:
     }
     return taxonomyContextRefTypes.pop() if len(taxonomyContextRefTypes) == 1 else OIMDefaultContextElement
 
+def _preReadCsvFiles(modelXbrl, tables, _dir):
+    """Pre-read all CSV file bytes from the archive into memory for faster access.
+
+    This eliminates repeated ZIP I/O during CSV fact processing by reading all
+    table CSV files upfront. For ZIP archives, each file read decompresses data,
+    so batching these reads reduces I/O overhead.
+    """
+    preReadData = {}  # tablePath -> bytes content
+
+    def _readOne(tablePath):
+        try:
+            fileObj = modelXbrl.fileSource.file(tablePath, binary=True)[0]
+            data = fileObj.read()
+            fileObj.close()
+            return tablePath, data
+        except Exception:
+            return tablePath, None
+
+    pathsToRead = []
+    for tableId, table in tables.items():
+        tableUrl = table.get("url", "")
+        if not tableUrl.endswith(".xlsx") and "#" not in tableUrl:
+            tablePath = os.path.normpath(os.path.join(_dir, tableUrl))
+            if modelXbrl.fileSource.exists(tablePath):
+                pathsToRead.append(tablePath)
+
+    if pathsToRead:
+        with ThreadPoolExecutor(max_workers=min(4, len(pathsToRead))) as executor:
+            futures = {executor.submit(_readOne, p): p for p in pathsToRead}
+            for future in as_completed(futures):
+                tablePath, data = future.result()
+                if data is not None:
+                    preReadData[tablePath] = data
+
+    return preReadData
+
+
 def _loadFromOIM(cntlr, error, warning, modelXbrl, oimFile, mappedUri):
     from openpyxl import load_workbook
     from openpyxl.cell import Cell
@@ -671,26 +709,34 @@ def _loadFromOIM(cntlr, error, warning, modelXbrl, oimFile, mappedUri):
 
         currentAction = "loading and parsing OIM file"
         loadDictErrors = []
+        _preReadCache = {}  # will be populated for CSV/XL loading
         def openCsvReader(csvFilePath, fileType):
-            _file = modelXbrl.fileSource.file(csvFilePath, binary=True)[0]
-            bytes = _file.read(16) # test encoding
+            # Use pre-read data if available, otherwise read from file source
+            if csvFilePath in _preReadCache:
+                rawBytes = _preReadCache[csvFilePath]
+                bytesForCheck = rawBytes[:16]
+            else:
+                _file = modelXbrl.fileSource.file(csvFilePath, binary=True)[0]
+                rawBytes = _file.read()
+                _file.close()
+                bytesForCheck = rawBytes[:16]
             try:
-                m = EBCDIC_Bytes_Pattern.match(bytes)
-                if m and not NEVER_EBCDIC_Bytes_Pattern.findall(bytes):
+                m = EBCDIC_Bytes_Pattern.match(bytesForCheck)
+                if m and not NEVER_EBCDIC_Bytes_Pattern.findall(bytesForCheck):
                     raise OIMException("xbrlce:invalidCSVFileFormat",
                           _("CSV file MUST use utf-8 encoding: %(file)s, appears to be EBCDIC"),
                           file=csvFilePath)
-                m = UTF_7_16_Bytes_Pattern.match(bytes)
+                m = UTF_7_16_Bytes_Pattern.match(bytesForCheck)
                 if m:
                     raise OIMException("xbrlce:invalidCSVFileFormat",
                           _("CSV file MUST use utf-8 encoding: %(file)s, appears to be %(encoding)s"),
                           file=csvFilePath, encoding=m.lastgroup)
-                _file.close()
             except UnicodeDecodeError as ex:
                 raise OIMException("xbrlce:invalidCSVFileFormat",
                       _("CSV file MUST use utf-8 encoding: %(file)s, appears to be %(encoding)s"),
                       file=csvFilePath, encoding=m.lastgroup)
-            _file = modelXbrl.fileSource.file(csvFilePath, encoding='utf-8-sig')[0]
+            # Create text IO from raw bytes
+            _file = io.TextIOWrapper(io.BytesIO(rawBytes), encoding='utf-8-sig')
             if CSV_HAS_HEADER_ROW:
                 try:
                     chars = _file.read(1024)
@@ -1285,6 +1331,9 @@ def _loadFromOIM(cntlr, error, warning, modelXbrl, oimFile, mappedUri):
             currentAction = "loading CSV facts tables"
             _dir = os.path.dirname(oimFile)
 
+            # Pre-read CSV files from archive into memory for faster access
+            _preReadCache.update(_preReadCsvFiles(modelXbrl, tables, _dir))
+
             def csvFacts():
                 parseMetadataCellValues(reportDimensions)
                 for tableId, table in tables.items():
@@ -1390,6 +1439,8 @@ def _loadFromOIM(cntlr, error, warning, modelXbrl, oimFile, mappedUri):
                             else:
                                 # must be CSV
                                 _rowIterator = openCsvReader(tablePath, CSV_FACTS_FILE)
+                                # Pre-read all rows into memory for faster iteration
+                                _rowIterator = list(_rowIterator)
                                 _cellValue = csvCellValue
                                 # if tableIsTransposed:
                                 #    _rowIterator = transposer(_rowIterator)
@@ -2103,6 +2154,10 @@ def _loadFromOIM(cntlr, error, warning, modelXbrl, oimFile, mappedUri):
 
         numFactCreationXbrlErrors = 0
 
+        # Cache for concept lookups to avoid repeated dictionary lookups
+        _conceptCache = {}  # conceptSQName -> (conceptQn, concept) or None
+        _qnameConcepts = modelXbrl.qnameConcepts  # local reference for faster access
+
         contextElement = getTaxonomyContextElement(modelXbrl)
         for id, fact in factItems:
             factProduced.clear()
@@ -2194,7 +2249,7 @@ def _loadFromOIM(cntlr, error, warning, modelXbrl, oimFile, mappedUri):
                 error("oime:misplacedNoteIDDimension",
                       _("Unexpected noteId dimension on non-footnote fact, id %(id)s"),
                       modelObject=modelXbrl, id=id, noteId=dimensions["noteId"])
-            concept = modelXbrl.qnameConcepts.get(conceptQn)
+            concept = _qnameConcepts.get(conceptQn)
             if concept is None:
                 error("oime:unknownConcept",
                       _("The concept QName could not be resolved with available DTS: %(concept)s."),
@@ -2316,7 +2371,7 @@ def _loadFromOIM(cntlr, error, warning, modelXbrl, oimFile, mappedUri):
                                       _("Fact %(factId)s taxonomy-defined dimension QName must not be xbrl prefixed: %(qname)s."),
                                       modelObject=modelXbrl, factId=id, qname=dimQname)
                                 continue
-                            dimConcept = modelXbrl.qnameConcepts.get(dimQname)
+                            dimConcept = _qnameConcepts.get(dimQname)
                             if dimConcept is None:
                                 error("oime:unknownDimension",
                                       _("Fact %(factId)s taxonomy-defined dimension QName not be resolved with available DTS: %(qname)s."),
@@ -2337,7 +2392,7 @@ def _loadFromOIM(cntlr, error, warning, modelXbrl, oimFile, mappedUri):
                                           _("Fact %(factId)s taxonomy-defined explicit dimension value is invalid: %(memberQName)s."),
                                           modelObject=modelXbrl, factId=id, memberQName=dimVal)
                                     continue
-                                memConcept = modelXbrl.qnameConcepts.get(mem)
+                                memConcept = _qnameConcepts.get(mem)
                                 if memConcept is not None and modelXbrl.dimensionDefaultConcepts.get(dimConcept) == memConcept:
                                     error("{}:invalidDimensionValue".format("oime" if valErrPrefix == "xbrlje" else valErrPrefix),
                                           _("Fact %(factId)s taxonomy-defined explicit dimension value must not be the default member: %(memberQName)s."),
